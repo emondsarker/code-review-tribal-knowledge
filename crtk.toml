@@ -1,0 +1,32 @@
+[general]
+db_path = "~/.local/share/crtk/crtk.db"
+log_level = "INFO"
+
+[repos]
+list = [
+    "kivaai/core-platform-backend",
+    "kivaai/core-platform-web",
+    "kivaai/core-platform-file-processing-pipelines",
+]
+
+[fetch]
+page_size = 100
+max_retries = 5
+base_delay_seconds = 1.0
+max_delay_seconds = 60.0
+inter_request_delay = 0.5
+
+[search]
+fts_weight = 0.4
+vector_weight = 0.6
+default_limit = 15
+
+[embeddings]
+model = "all-MiniLM-L6-v2"
+
+[tagging]
+auto_tag_on_fetch = true
+
+[synthesis]
+mode = "template"
+max_comments = 20
