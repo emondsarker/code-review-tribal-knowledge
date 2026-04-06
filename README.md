@@ -15,8 +15,26 @@ CRTK harvests PR review comments from GitHub, builds a searchable knowledge base
 
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- GitHub CLI (`gh`) authenticated with repo access
+- [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated
 - ~500MB disk for PyTorch + embedding model (first run)
+
+### GitHub CLI setup
+
+CRTK uses `gh` to fetch PR data. Install it, then authenticate:
+
+```bash
+# Install (see https://cli.github.com/ for other platforms)
+sudo apt install gh        # Debian/Ubuntu
+brew install gh            # macOS
+
+# Authenticate — this opens a browser for OAuth
+gh auth login
+
+# Verify you have access to the repos you want to fetch
+gh repo view your-org/your-repo
+```
+
+You need read access to the repositories listed in `crtk.toml`.
 
 ## Installation
 
@@ -40,6 +58,21 @@ Verify:
 ```bash
 crtk --help
 ```
+
+## First Run
+
+After installing, you need to fetch PR review data before anything else works:
+
+```bash
+# 1. Edit crtk.toml to list your repos
+# 2. Fetch all PR review comments (takes a few minutes on first run)
+crtk fetch --full
+
+# 3. Verify data was fetched
+crtk stats
+```
+
+The first fetch will also download the embedding model (~22MB) and auto-generate embeddings + tags for all comments. Subsequent fetches are incremental and much faster.
 
 ## Configuration
 
@@ -245,11 +278,18 @@ The SQLite database at `~/.local/share/crtk/crtk.db` (~3MB for 477 comments) is 
 ### Export a database dump
 
 ```bash
-# Option 1: Copy the file directly
+# Option 1: Copy the file directly (simplest)
 cp ~/.local/share/crtk/crtk.db ./crtk-dump.db
 
 # Option 2: SQL dump (text-based, version-controllable)
-sqlite3 ~/.local/share/crtk/crtk.db .dump > crtk-dump.sql
+python -c "
+import sqlite3
+conn = sqlite3.connect('$HOME/.local/share/crtk/crtk.db')
+with open('crtk-dump.sql', 'w') as f:
+    for line in conn.iterdump():
+        f.write(line + '\n')
+conn.close()
+"
 
 # Option 3: Compressed for sharing
 gzip -c ~/.local/share/crtk/crtk.db > crtk-dump.db.gz
@@ -262,8 +302,13 @@ gzip -c ~/.local/share/crtk/crtk.db > crtk-dump.db.gz
 cp crtk-dump.db ~/.local/share/crtk/crtk.db
 
 # From a SQL dump
-mkdir -p ~/.local/share/crtk
-sqlite3 ~/.local/share/crtk/crtk.db < crtk-dump.sql
+python -c "
+import sqlite3
+conn = sqlite3.connect('$HOME/.local/share/crtk/crtk.db')
+with open('crtk-dump.sql', 'r') as f:
+    conn.executescript(f.read())
+conn.close()
+"
 
 # From a compressed dump
 gunzip -c crtk-dump.db.gz > ~/.local/share/crtk/crtk.db
