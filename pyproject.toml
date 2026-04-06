@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "crtk"
+version = "0.1.0"
+description = "Code Review Tribal Knowledge — harvest and query team review conventions"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1",
+    "numpy>=1.26",
+    "sentence-transformers>=3.0",
+    "mcp>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+crtk = "crtk.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/crtk"]
