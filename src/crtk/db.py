@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 def init_db(db_path: Path) -> sqlite3.Connection:
     """Create database and initialize schema."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

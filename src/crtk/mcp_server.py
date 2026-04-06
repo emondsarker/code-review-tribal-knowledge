@@ -132,7 +132,7 @@ async def _handle_search_conventions(
     pr_title = arguments.get("pr_title")
     commit_messages = arguments.get("commit_messages")
     tags = arguments.get("tags")
-    limit = arguments.get("limit", 10)
+    limit = max(1, min(int(arguments.get("limit", 10)), 100))
 
     results = hybrid_search(
         conn, config,

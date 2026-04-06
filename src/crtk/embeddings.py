@@ -42,7 +42,7 @@ def _get_model(model_name: str):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            _model = SentenceTransformer(model_name, trust_remote_code=True)
+            _model = SentenceTransformer(model_name)
     finally:
         os.dup2(old_stdout_fd, 1)
         os.dup2(old_stderr_fd, 2)
