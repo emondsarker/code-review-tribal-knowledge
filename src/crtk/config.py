@@ -16,6 +16,12 @@ _SEARCH_PATHS = [
 
 
 @dataclass
+class RepoConfig:
+    name: str
+    platform: str = "github"
+
+
+@dataclass
 class FetchConfig:
     page_size: int = 100
     max_retries: int = 5
@@ -51,7 +57,7 @@ class SynthesisConfig:
 class CrtkConfig:
     db_path: str = "~/.local/share/crtk/crtk.db"
     log_level: str = "INFO"
-    repos: list[str] = field(default_factory=list)
+    repos: list[RepoConfig] = field(default_factory=list)
     fetch: FetchConfig = field(default_factory=FetchConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     embeddings: EmbeddingsConfig = field(default_factory=EmbeddingsConfig)
@@ -95,10 +101,18 @@ def _parse_config(raw: dict) -> CrtkConfig:
     tagging_section = raw.get("tagging", {})
     synthesis_section = raw.get("synthesis", {})
 
+    repo_list = []
+    for r in repos_section.get("list", []):
+        if ":" in r:
+            platform, name = r.split(":", 1)
+            repo_list.append(RepoConfig(name=name, platform=platform))
+        else:
+            repo_list.append(RepoConfig(name=r))
+
     return CrtkConfig(
         db_path=general.get("db_path", CrtkConfig.db_path),
         log_level=general.get("log_level", CrtkConfig.log_level),
-        repos=repos_section.get("list", []),
+        repos=repo_list,
         fetch=FetchConfig(**{k: v for k, v in fetch_section.items() if hasattr(FetchConfig, k)}),
         search=SearchConfig(**{k: v for k, v in search_section.items() if hasattr(SearchConfig, k)}),
         embeddings=EmbeddingsConfig(**{k: v for k, v in embeddings_section.items() if hasattr(EmbeddingsConfig, k)}),

@@ -29,6 +29,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -64,7 +65,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 );
 
 CREATE TABLE IF NOT EXISTS reviews (
-    id              INTEGER PRIMARY KEY,
+    id              TEXT PRIMARY KEY,
     repo            TEXT NOT NULL,
     pr_number       INTEGER NOT NULL,
     user_login      TEXT NOT NULL,
@@ -108,8 +109,11 @@ CREATE INDEX IF NOT EXISTS idx_reviews_pr ON reviews(repo, pr_number);
 REPO_URL_RE = re.compile(
     r"github\.com/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$"
 )
+GLAB_URL_RE = re.compile(
+    r"gitlab\.com/(.+)/([^/]+?)(?:\.git)?/?$"
+)
 # Also accept bare "owner/repo" shorthand.
-REPO_SHORT_RE = re.compile(r"^([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?$")
+REPO_SHORT_RE = re.compile(r"^(.+)/([^/]+?)(?:\.git)?$")
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -122,9 +126,9 @@ def print_banner() -> None:
     print("  crtk-collect — PR review collector")
     print("=" * 60)
     print("This script will:")
-    print("  1. Check that `gh` CLI is installed and authenticated.")
-    print("  2. Ask you for the GitHub repos you've worked on.")
-    print("  3. Find every PR you authored in those repos.")
+    print("  1. Check for `gh` or `glab` CLI authentication.")
+    print("  2. Ask you for the GitHub/GitLab repos you've worked on.")
+    print("  3. Find every PR/MR you authored in those repos.")
     print("  4. Save each PR's metadata, review comments, reviewer")
     print("     submissions, and full diff into a single .db file.")
     print()
@@ -178,6 +182,33 @@ def check_gh() -> str:
     return login
 
 
+def check_glab() -> str:
+    """Verify glab CLI is installed and authenticated. Return active login."""
+    try:
+        subprocess.run(["glab", "--version"], capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        die("`glab` CLI not found.\n"
+            "  Install: https://glab.readthedocs.io/\n"
+            "  Then run: glab auth login")
+
+    # Force gitlab.com hostname to avoid confusion in GitHub repos
+    who = subprocess.run(
+        ["glab", "api", "user", "--hostname", "gitlab.com"],
+        capture_output=True, text=True,
+    )
+    if who.returncode != 0:
+        die("glab is not authenticated.\n  Run: glab auth login")
+    
+    try:
+        data = json.loads(who.stdout)
+        login = data["username"]
+    except (json.JSONDecodeError, KeyError):
+        die("could not parse glab user response. Try: glab auth status")
+
+    print(f"glab CLI: authenticated as '{login}' (active)\n")
+    return login
+
+
 def verify_repo_access(owner: str, repo: str) -> tuple[bool, str]:
     """Check active gh account can read this repo. Returns (ok, message)."""
     result = subprocess.run(
@@ -203,13 +234,8 @@ def _is_transient(stderr: str) -> bool:
     return any(m.lower() in s for m in _TRANSIENT_MARKERS)
 
 
-def run_gh(cmd: list[str], label: str | None = None) -> subprocess.CompletedProcess:
-    """Run a `gh` command with exponential-backoff retry on transient errors.
-
-    Permanent errors (404, auth) raise immediately. Transient errors (rate
-    limit, 5xx, network) retry up to MAX_RETRIES with jittered exponential
-    backoff. Final failure raises RuntimeError.
-    """
+def run_cmd(cmd: list[str], label: str | None = None) -> subprocess.CompletedProcess:
+    """Run a command with exponential-backoff retry on transient errors."""
     label = label or " ".join(cmd[:3])
     last_err = ""
     for attempt in range(MAX_RETRIES + 1):
@@ -227,6 +253,241 @@ def run_gh(cmd: list[str], label: str | None = None) -> subprocess.CompletedProc
         )
         time.sleep(delay)
     raise RuntimeError(f"{label} failed after {MAX_RETRIES} retries: {last_err}")
+
+
+def glab_api_json(endpoint: str, paginate: bool = False):
+    """Call glab api and parse JSON."""
+    cmd = ["glab", "api", endpoint, "--hostname", "gitlab.com"]
+    if paginate:
+        cmd += ["--paginate"]
+    result = run_cmd(cmd, label=f"glab api {endpoint}")
+    text = result.stdout or "null"
+    if paginate and text.strip().startswith("["):
+        # Handle concatenated arrays: [..][..] or [..]\n[..]
+        text = text.strip().replace("]\n[", ",").replace("][", ",")
+    return json.loads(text)
+
+
+
+class Collector(ABC):
+    @abstractmethod
+    def verify_access(self, owner: str, repo: str) -> tuple[bool, str]:
+        pass
+
+    @abstractmethod
+    def discover_prs(self, owner: str, repo: str, author: str | None, state: str) -> list[int]:
+        pass
+
+    @abstractmethod
+    def collect_pr(self, conn: sqlite3.Connection, owner: str, repo: str,
+                   number: int, fetched_by: str) -> tuple[int, int]:
+        pass
+
+
+class GitHubCollector(Collector):
+    def verify_access(self, owner: str, repo: str) -> tuple[bool, str]:
+        result = subprocess.run(
+            ["gh", "api", f"/repos/{owner}/{repo}", "--jq", ".full_name"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return True, result.stdout.strip()
+        err = (result.stderr or "").strip()
+        if "404" in err or "Not Found" in err:
+            return False, "not found or no access"
+        return False, err.splitlines()[-1] if err else "unknown error"
+
+    def discover_prs(self, owner: str, repo: str, author: str | None,
+                     state: str) -> list[int]:
+        repo_full = f"{owner}/{repo}"
+        cmd = ["gh", "search", "prs", "--repo", repo_full, "--limit", "1000", "--json", "number"]
+        if author:
+            cmd += ["--author", author]
+        if state in ("open", "closed"):
+            cmd += ["--state", state]
+        result = run_cmd(cmd, label=f"gh search prs --repo {repo_full}")
+        data = json.loads(result.stdout or "[]")
+        return [item["number"] for item in data]
+
+    def collect_pr(self, conn: sqlite3.Connection, owner: str, repo: str,
+                   number: int, fetched_by: str) -> tuple[int, int]:
+        repo_full = f"{owner}/{repo}"
+        now = datetime.now(timezone.utc).isoformat()
+        pr = gh_api_json(f"/repos/{repo_full}/pulls/{number}")
+        conn.execute(
+            """INSERT OR REPLACE INTO pull_requests
+               (id, repo, number, title, user_login, merged_at, created_at,
+                updated_at, html_url, state, base_ref, head_ref, fetched_by, fetched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pr["id"], repo_full, pr["number"], pr["title"], pr["user"]["login"],
+             pr.get("merged_at"), pr["created_at"], pr["updated_at"], pr["html_url"],
+             pr.get("state"), (pr.get("base") or {}).get("ref"),
+             (pr.get("head") or {}).get("ref"), fetched_by, now),
+        )
+        comments = gh_api_json(f"/repos/{repo_full}/pulls/{number}/comments?per_page=100", paginate=True)
+        for c in comments:
+            conn.execute(
+                """INSERT OR REPLACE INTO comments
+                   (id, repo, pr_number, review_id, user_login, body, path, line,
+                    original_line, side, diff_hunk, commit_id, author_association,
+                    in_reply_to_id, created_at, updated_at, html_url)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (c["id"], repo_full, number, c.get("pull_request_review_id"),
+                 c["user"]["login"], c.get("body") or "", c.get("path"), c.get("line"),
+                 c.get("original_line"), c.get("side"), c.get("diff_hunk"), c.get("commit_id"),
+                 c.get("author_association"), c.get("in_reply_to_id"), c["created_at"],
+                 c["updated_at"], c["html_url"]),
+            )
+        reviews = gh_api_json(f"/repos/{repo_full}/pulls/{number}/reviews?per_page=100", paginate=True)
+        rc = 0
+        for r in reviews:
+            if not r.get("submitted_at"): continue
+            conn.execute(
+                """INSERT OR REPLACE INTO reviews (id, repo, pr_number, user_login, state, body, submitted_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (r["id"], repo_full, number, r["user"]["login"], r["state"], r.get("body"), r["submitted_at"]),
+            )
+            rc += 1
+        diff = gh_api_raw(f"/repos/{repo_full}/pulls/{number}", "application/vnd.github.v3.diff")
+        conn.execute("INSERT OR REPLACE INTO pr_diffs (repo, pr_number, diff, fetched_at) VALUES (?,?,?,?)",
+                     (repo_full, number, diff, now))
+        conn.commit()
+        return len(comments), rc
+
+
+class GitLabCollector(Collector):
+    def verify_access(self, owner: str, repo: str) -> tuple[bool, str]:
+        path = f"{owner}/{repo}".replace("/", "%2F")
+        result = subprocess.run(["glab", "api", f"projects/{path}", "--hostname", "gitlab.com"], capture_output=True, text=True)
+        if result.returncode == 0:
+            return True, f"{owner}/{repo}"
+        return False, "project not found or no access"
+
+    def discover_prs(self, owner: str, repo: str, author: str | None,
+                     state: str) -> list[int]:
+        path = f"{owner}/{repo}".replace("/", "%2F")
+        endpoint = f"projects/{path}/merge_requests?per_page=100"
+        if author: endpoint += f"&author_username={author}"
+        if state == "open": endpoint += "&state=opened"
+        elif state == "closed": endpoint += "&state=closed"
+        data = glab_api_json(endpoint, paginate=True)
+        return [item["iid"] for item in data]
+
+    def collect_pr(self, conn: sqlite3.Connection, owner: str, repo: str,
+                   number: int, fetched_by: str) -> tuple[int, int]:
+        path = f"{owner}/{repo}".replace("/", "%2F")
+        repo_full = f"{owner}/{repo}"
+        now = datetime.now(timezone.utc).isoformat()
+        mr = glab_api_json(f"projects/{path}/merge_requests/{number}")
+        
+        # Cache diffs for hunk extraction
+        try:
+            diffs_list = glab_api_json(f"projects/{path}/merge_requests/{number}/diffs", paginate=True)
+            diffs_map = {d["new_path"]: d["diff"] for d in diffs_list}
+            full_diff = "\n".join(f"--- {d['new_path']}\n+++ {d['new_path']}\n{d['diff']}" for d in diffs_list)
+        except Exception as e:
+            logger.warning("Diff fetch failed: %s", e)
+            diffs_map = {}
+            full_diff = ""
+
+        conn.execute(
+            """INSERT OR REPLACE INTO pull_requests
+               (id, repo, number, title, user_login, merged_at, created_at,
+                updated_at, html_url, state, base_ref, head_ref, fetched_by, fetched_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (mr["id"], repo_full, mr["iid"], mr["title"], mr["author"]["username"],
+             mr.get("merged_at"), mr["created_at"], mr["updated_at"], mr["web_url"],
+             mr.get("state"), mr.get("target_branch"), mr.get("source_branch"), fetched_by, now),
+        )
+
+        # Use Discussions API for code comments
+        discussions = glab_api_json(f"projects/{path}/merge_requests/{number}/discussions?per_page=100", paginate=True)
+        cc = 0
+        for disc in discussions:
+            for n in disc.get("notes", []):
+                if n.get("system"): continue
+                pos = n.get("position") or {}
+                new_path = pos.get("new_path")
+                new_line = pos.get("new_line")
+                
+                hunk = None
+                if new_path in diffs_map and new_line:
+                    hunk = _extract_gl_hunk(diffs_map[new_path], new_line)
+
+                conn.execute(
+                    """INSERT OR REPLACE INTO comments
+                       (id, repo, pr_number, review_id, user_login, body, path, line,
+                        original_line, side, diff_hunk, commit_id, author_association,
+                        in_reply_to_id, created_at, updated_at, html_url)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (n["id"], repo_full, number, None, n["author"]["username"],
+                     n.get("body") or "", new_path or pos.get("old_path"),
+                     new_line or pos.get("old_line"), None, "RIGHT" if new_line else "LEFT",
+                     hunk, None, None, None, n["created_at"], n["updated_at"],
+                     f"{mr['web_url']}#note_{n['id']}"),
+                )
+                cc += 1
+
+        # Fetch Approvals for reviews table
+        rc = 0
+        try:
+            approvals = glab_api_json(f"projects/{path}/merge_requests/{number}/approvals")
+            for app in approvals.get("approved_by", []):
+                user = app.get("user", {})
+                conn.execute(
+                    """INSERT OR REPLACE INTO reviews (id, repo, pr_number, user_login, state, body, submitted_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (f"{mr['id']}_{user['id']}", repo_full, number, user["username"], "APPROVED", None, now),
+                )
+                rc += 1
+        except: pass
+        
+        # Also check standard reviews if available
+        try:
+            reviews = glab_api_json(f"projects/{path}/merge_requests/{number}/reviews")
+            for r in reviews:
+                conn.execute(
+                    """INSERT OR REPLACE INTO reviews (id, repo, pr_number, user_login, state, body, submitted_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (r["id"], repo_full, number, r["author"]["username"], r.get("state", "APPROVED"), None, r["created_at"]),
+                )
+                rc += 1
+        except: pass
+
+        conn.execute("INSERT OR REPLACE INTO pr_diffs (repo, pr_number, diff, fetched_at) VALUES (?,?,?,?)",
+                     (repo_full, number, full_diff, now))
+        conn.commit()
+        return cc, rc
+
+
+def _extract_gl_hunk(diff_text: str, target_line: int) -> str | None:
+    """Extract context hunk from unified diff for target_line."""
+    lines = diff_text.splitlines()
+    current_line = 0
+    hunk_start = 0
+    
+    for i, line in enumerate(lines):
+        if line.startswith("@@"):
+            # Format: @@ -old_start,old_count +new_start,new_count @@
+            m = re.search(r"\+(\d+)", line)
+            if m:
+                current_line = int(m.group(1)) - 1
+            hunk_start = i
+            continue
+        
+        if not line.startswith("-"):
+            current_line += 1
+            
+        if current_line == target_line:
+            # Found line. Return hunk from @@ or +/- 5 lines
+            start = max(hunk_start, i - 5)
+            end = min(len(lines), i + 6)
+            return "\n".join(lines[start:end])
+    return None
+
+
+def run_gh(cmd: list[str], label: str | None = None) -> subprocess.CompletedProcess:
+    return run_cmd(cmd, label)
 
 
 def gh_api_json(endpoint: str, paginate: bool = False):
@@ -257,16 +518,17 @@ def gh_api_raw(endpoint: str, accept: str) -> str:
     return result.stdout
 
 
-def parse_repo_urls(raw_lines: list[str]) -> list[tuple[str, str]]:
+def parse_repo_urls(raw_lines: list[str], platform: str) -> list[tuple[str, str]]:
     seen = set()
     repos: list[tuple[str, str]] = []
+    url_re = GLAB_URL_RE if platform == "gitlab" else REPO_URL_RE
     for line in raw_lines:
         line = line.strip().rstrip("/")
         if not line or line.startswith("#"):
             continue
-        m = REPO_URL_RE.search(line) or REPO_SHORT_RE.match(line)
+        m = url_re.search(line) or REPO_SHORT_RE.match(line)
         if not m:
-            print(f"  skipped (not a repo URL): {line}", file=sys.stderr)
+            print(f"  skipped (not a valid {platform} repo URL): {line}", file=sys.stderr)
             continue
         owner, repo = m.group(1), m.group(2)
         key = (owner, repo)
@@ -277,11 +539,14 @@ def parse_repo_urls(raw_lines: list[str]) -> list[tuple[str, str]]:
     return repos
 
 
-def prompt_repos() -> list[tuple[str, str]]:
+def prompt_repos(platform: str) -> list[tuple[str, str]]:
     print()
-    print("Paste repo URLs (one per line). Blank line to finish.")
+    print(f"Paste {platform.capitalize()} repo URLs (one per line). Blank line to finish.")
     print("Examples:")
-    print("  https://github.com/owner/repo")
+    if platform == "github":
+        print("  https://github.com/owner/repo")
+    else:
+        print("  https://gitlab.com/owner/repo")
     print("  owner/repo")
     print()
     lines: list[str] = []
@@ -295,7 +560,7 @@ def prompt_repos() -> list[tuple[str, str]]:
                 break
             continue
         lines.append(line)
-    repos = parse_repo_urls(lines)
+    repos = parse_repo_urls(lines, platform)
     if not repos:
         die("no valid repo URLs provided.")
     print(f"\nCollected {len(repos)} unique repo(s).")
@@ -408,10 +673,9 @@ def main() -> int:
     ap.add_argument("--db", type=Path, default=None,
                     help="output sqlite path (default: ./crtk-collect-<ts>.db)")
     ap.add_argument("--login", default=None,
-                    help="GitHub login to filter PRs by author and tag as "
-                         "fetched_by (defaults to active gh account)")
+                    help="Login to filter PRs by author")
     ap.add_argument("--all-authors", action="store_true",
-                    help="fetch PRs by any author, not just --login")
+                    help="fetch PRs by any author")
     ap.add_argument("--state", choices=["all", "closed", "open"], default="all",
                     help="PR state filter (default: all)")
     ap.add_argument("--repos-file", type=Path, default=None,
@@ -419,34 +683,46 @@ def main() -> int:
     args = ap.parse_args()
 
     print_banner()
-    active_login = check_gh()
+    
+    print("Select platform:")
+    print("  h) GitHub (gh)")
+    print("  l) GitLab (glab)")
+    choice = input("Choice [h]: ").strip().lower() or "h"
+    platform = "gitlab" if choice == "l" else "github"
+    
+    if platform == "github":
+        active_login = check_gh()
+        collector = GitHubCollector()
+    else:
+        active_login = check_glab()
+        collector = GitLabCollector()
+
     fetched_by = args.login or active_login
     author_filter = None if args.all_authors else fetched_by
 
     if args.repos_file:
-        repos = parse_repo_urls(args.repos_file.read_text().splitlines())
+        repos = parse_repo_urls(args.repos_file.read_text().splitlines(), platform)
         if not repos:
             die(f"no valid repo URLs in {args.repos_file}")
         print(f"Loaded {len(repos)} repo(s) from {args.repos_file}.")
     else:
-        repos = prompt_repos()
+        repos = prompt_repos(platform)
 
     # Access check before any expensive work.
     print()
-    print("Verifying access to each repo with the active gh account...")
+    print(f"Verifying access to each repo with the active {platform} account...")
     accessible: list[tuple[str, str]] = []
     for owner, repo in repos:
-        ok, msg = verify_repo_access(owner, repo)
+        ok, msg = collector.verify_access(owner, repo)
         if ok:
             print(f"  OK  {owner}/{repo}")
             accessible.append((owner, repo))
         else:
             print(f"  --  {owner}/{repo}  ({msg})")
+    
     if not accessible:
-        die("no accessible repos. If these are private, switch accounts:\n"
-            "  gh auth switch -u <login>\n"
-            "or authenticate the right account:\n"
-            "  gh auth login")
+        die(f"no accessible repos for {platform}.")
+
     skipped = len(repos) - len(accessible)
     if skipped:
         print(f"  ({skipped} repo(s) skipped — see above)")
@@ -462,7 +738,7 @@ def main() -> int:
     for owner, repo in accessible:
         print(f"  discovering {owner}/{repo} ... ", end="", flush=True)
         try:
-            numbers = discover_prs(owner, repo, author_filter, args.state)
+            numbers = collector.discover_prs(owner, repo, author_filter, args.state)
         except Exception as e:
             print(f"FAILED: {e}")
             continue
@@ -485,7 +761,7 @@ def main() -> int:
         label = f"{owner}/{repo}#{number}"
         print(f"[{i}/{len(discovered)}] {label} ... ", end="", flush=True)
         try:
-            c, r = collect_pr(conn, owner, repo, number, fetched_by)
+            c, r = collector.collect_pr(conn, owner, repo, number, fetched_by)
             total_c += c
             total_r += r
             ok += 1

@@ -4,7 +4,7 @@ CRTK harvests PR review comments from GitHub, builds a searchable knowledge base
 
 ## What it does
 
-1. **Fetches** all merged PR review comments from configured GitHub repos
+1. **Fetches** all merged PR review comments from configured GitHub/GitLab repos
 2. **Embeds** each comment using a local embedding model (`all-MiniLM-L6-v2`, 22MB)
 3. **Tags** comments with metadata categories (43 tags: `database`, `naming`, `n-plus-one-queries`, etc.)
 4. **Searches** via 3-stage hybrid search: tag pre-filter → FTS5 keyword + vector cosine → Reciprocal Rank Fusion
@@ -16,22 +16,19 @@ CRTK harvests PR review comments from GitHub, builds a searchable knowledge base
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 - [GitHub CLI (`gh`)](https://cli.github.com/) installed and authenticated
+- [GitLab CLI (`glab`)](https://glab.readthedocs.io/) installed and authenticated
 - ~500MB disk for PyTorch + embedding model (first run)
 
-### GitHub CLI setup
+### CLI setup
 
-CRTK uses `gh` to fetch PR data. Install it, then authenticate:
+CRTK uses `gh` and `glab` to fetch PR data. Install them, then authenticate:
 
 ```bash
-# Install (see https://cli.github.com/ for other platforms)
-sudo apt install gh        # Debian/Ubuntu
-brew install gh            # macOS
-
-# Authenticate — this opens a browser for OAuth
+# GitHub
 gh auth login
 
-# Verify you have access to the repos you want to fetch
-gh repo view your-org/your-repo
+# GitLab
+glab auth login
 ```
 
 You need read access to the repositories listed in `crtk.toml`.
@@ -85,8 +82,8 @@ log_level = "INFO"                           # DEBUG for verbose output
 
 [repos]
 list = [
-    "your-org/repo-one",
-    "your-org/repo-two",
+    "github:your-org/repo-one",
+    "gitlab:your-org/repo-two",
 ]
 
 [fetch]
