@@ -78,7 +78,7 @@ def create_server(config: CrtkConfig, conn: sqlite3.Connection) -> Server:
             ),
             Tool(
                 name="fetch_new_reviews",
-                description="Trigger incremental fetch of new PR review comments from GitHub.",
+                description="Trigger incremental fetch of new PR review comments from GitHub and GitLab.",
                 inputSchema={
                     "type": "object",
                     "properties": {},

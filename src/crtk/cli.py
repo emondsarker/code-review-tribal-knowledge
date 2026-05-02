@@ -40,7 +40,7 @@ def main(ctx: click.Context, config_path: str | None) -> None:
 @click.option("--repo", default=None, help="Filter to a specific repo")
 @click.pass_context
 def fetch(ctx: click.Context, full: bool, repo: str | None) -> None:
-    """Fetch PR review data from GitHub."""
+    """Fetch PR review data from GitHub and GitLab."""
     from crtk.fetcher import run_fetch
 
     cfg = ctx.obj["config"]

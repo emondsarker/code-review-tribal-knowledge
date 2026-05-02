@@ -19,6 +19,14 @@ class GhApiError(Exception):
         super().__init__(f"gh api error (rc={returncode}): {stderr[:200]}")
 
 
+class GlabApiError(Exception):
+    def __init__(self, returncode: int, stderr: str, is_rate_limit: bool = False):
+        self.returncode = returncode
+        self.stderr = stderr
+        self.is_rate_limit = is_rate_limit
+        super().__init__(f"glab api error (rc={returncode}): {stderr[:200]}")
+
+
 def gh_api(endpoint: str, paginate: bool = False, method: str = "GET") -> list | dict:
     """Call gh api and return parsed JSON."""
     cmd = ["gh", "api", endpoint, "--method", method]
@@ -41,6 +49,31 @@ def gh_api(endpoint: str, paginate: bool = False, method: str = "GET") -> list |
     text = result.stdout.strip()
     if paginate and text.startswith("["):
         # Multiple arrays concatenated: "][" or "]\n["
+        text = text.replace("]\n[", ",").replace("][", ",")
+
+    return json.loads(text)
+
+
+def glab_api(endpoint: str, paginate: bool = False, method: str = "GET") -> list | dict:
+    """Call glab api and return parsed JSON."""
+    cmd = ["glab", "api", endpoint, "--method", method]
+    if paginate:
+        cmd.append("--paginate")
+
+    logger.debug("glab api call: %s", " ".join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        is_rate = "429" in stderr or "rate limit" in stderr.lower()
+        raise GlabApiError(result.returncode, stderr, is_rate_limit=is_rate)
+
+    if not result.stdout.strip():
+        return []
+
+    text = result.stdout.strip()
+    if paginate and text.startswith("["):
+        # glab --paginate behavior similar to gh
         text = text.replace("]\n[", ",").replace("][", ",")
 
     return json.loads(text)
@@ -85,6 +118,39 @@ def gh_api_with_retry(endpoint: str, paginate: bool = False,
             time.sleep(delay)
 
     return []  # unreachable, but satisfies type checker
+
+
+def glab_api_with_retry(endpoint: str, paginate: bool = False,
+                       max_retries: int = 5, base_delay: float = 1.0,
+                       max_delay: float = 60.0) -> list | dict:
+    """Call glab_api with exponential backoff retry."""
+    for attempt in range(max_retries + 1):
+        try:
+            return glab_api(endpoint, paginate=paginate)
+        except GlabApiError as e:
+            if attempt == max_retries:
+                logger.error("Max retries reached for GL %s", endpoint)
+                raise
+
+            if e.is_rate_limit or any(s in e.stderr.lower() for s in ["timeout", "connection", "network", "500", "502", "503", "504"]):
+                delay = min(base_delay * (2 ** attempt), max_delay)
+                delay += random.uniform(0, base_delay)
+                logger.warning(
+                    "Error on GL %s (attempt %d/%d). Retrying in %.1fs",
+                    endpoint, attempt + 1, max_retries, delay,
+                )
+                time.sleep(delay)
+            else:
+                raise
+        except subprocess.TimeoutExpired:
+            if attempt == max_retries:
+                raise
+            delay = min(base_delay * (2 ** attempt), max_delay)
+            logger.warning("Timeout on GL %s (attempt %d/%d). Retrying in %.1fs",
+                           endpoint, attempt + 1, max_retries, delay)
+            time.sleep(delay)
+
+    return []
 
 
 def check_rate_limit() -> dict:
